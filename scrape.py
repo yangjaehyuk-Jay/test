@@ -29,6 +29,11 @@ OUT_DIR = BASE / "output"
 LOG_DIR = BASE / "logs"
 COMPANIES = BASE / "companies.csv"
 
+# 목록 파일마다 결과 파일을 따로 쓰기 위한 꼬리표.
+# companies.csv -> "" (파생거래_20260901.xlsx)
+# companies1.csv -> "1" (파생거래1_20260901.xlsx)
+OUT_TAG = ""
+
 HOST = "https://bizinfo.kfb.or.kr"
 START_URL = HOST + "/biz/index.html"
 POPUP_URL = (HOST + "/biz/popup.html"
@@ -77,7 +82,45 @@ COLMAP = [
     ("USD환산금액", "BNS_AMT_USD_CVT_AMT"),
     ("조회일시", "RETRIEVE_DTTM"),
 ]
-NUMERIC = {c for c, _ in COLMAP if "잔액" in c or "건수" in c or "환산" in c}
+# 엑셀 맨 끝에 붙이는 합계 열.
+# 옵션은 '매수' 포지션만 넣는다. 매수콜은 사실상 매수 포지션, 매수풋은 매도
+# 포지션이므로 각각 매수/매도 쪽에 더한다. 매도콜·매도풋은 넣지 않는다.
+# 원본 잔액은 USD 단위라 자릿수가 커서 읽기 어렵다. 합계 열만 백만 단위로 줄인다.
+SUM_UNIT = 1_000_000
+SUMCOLS = [
+    ("선물환매수+통화스왑매수+옵션콜매수_잔액(USD mn)",
+     ("선물환_매수잔액", "통화스왑_매수잔액", "옵션_매수콜")),
+    ("선물환매도+스왑매도+옵션풋매수_잔액(USD mn)",
+     ("선물환_매도잔액", "통화스왑_매도잔액", "옵션_매수풋")),
+]
+# 숫자 열은 이름이 아니라 응답 키로 고른다. 이름으로 "잔액"만 찾으면
+# 옵션_매수콜(OP_BUY_CALL_BAL) 처럼 '잔액'이 안 붙은 열이 문자열로 남는다.
+COUNTCOLS = {c for c, k in COLMAP if k.endswith("_CNT")}
+NUMERIC = {c for c, k in COLMAP
+           if k.endswith("_BAL") or k.endswith("_CNT") or k.endswith("_AMT")}
+NUMERIC |= {c for c, _ in SUMCOLS}
+
+# 조회 자체가 실패한 행의 결과코드. 서버가 주는 값(000/401)과 겹치지 않게 쓴다.
+ERR_CD = "ERR"
+OK_CD = "000"          # 정상. 이 값이 아니면 결과가 없는 행이다
+# 결과가 없는 행의 합계 열에는 숫자 대신 이 문구를 넣는다
+NO_RESULT_TEXT = "붙이지 마시오"
+
+
+def norm_rspcd(v):
+    """결과코드를 3자리 문자열로 되돌린다.
+
+    엑셀을 거치면 '000' 이 숫자 0 으로 바뀐다. 그대로 두면 정상 행까지
+    '결과 없음' 으로 잘못 잡히므로, 숫자로 온 값은 0 을 채워 되돌린다.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s in ("", "nan", "None"):
+        return None
+    if s.replace(".0", "").isdigit():
+        return s.replace(".0", "").zfill(3)
+    return s
 
 INJECT_JS = """
 (() => {
@@ -158,29 +201,74 @@ def read_text_any(path):
     return raw.decode("utf-8", errors="replace"), "utf-8(손상)"
 
 
-def load_companies(path):
-    """companies.csv 를 읽는다. 첫 열이 사업자등록번호, 둘째 열(선택)이 메모."""
+def normalize_bizno(raw):
+    """사업자등록번호 문자열을 10자리 숫자로 만든다.
+
+    엑셀은 '0124011628' 을 숫자로 보고 앞의 0 을 떼어 '124011628' 로 저장한다.
+    사업자등록번호는 언제나 10자리이므로, 짧게 들어온 값은 앞을 0 으로 채운다.
+    ="0124011628" / '0124011628 / 012-40-11628 같은 표기도 모두 받는다.
+    반환: (10자리, 보정메모) 또는 (None, 사유)
+    """
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None, "숫자 없음"
+    if len(digits) == 10:
+        return digits, ""
+    if len(digits) > 10:
+        return None, "10자리 초과(%d자리)" % len(digits)
+    if len(digits) >= 8:
+        # 엑셀이 떼어낸 선행 0 을 되돌린다 (최대 2자리까지만)
+        return digits.zfill(10), "선행 0 복원: %s -> %s" % (digits, digits.zfill(10))
+    return None, "10자리 아님(%d자리)" % len(digits)
+
+
+def bizno_checksum_ok(d):
+    """국세청 사업자등록번호 검증코드(마지막 자리) 확인.
+
+    앞 9자리에 가중치 1,3,7,1,3,7,1,3,5 를 곱해 더하고
+    9번째 자리 x 5 의 십의 자리를 더한 뒤, 10 의 보수가 마지막 자리와 같아야 한다.
+    오타/자릿수 누락을 조회 전에 걸러내는 용도다. 실패해도 조회는 막지 않는다.
+    """
+    if len(d) != 10 or not d.isdigit():
+        return False
+    w = (1, 3, 7, 1, 3, 7, 1, 3, 5)
+    s = sum(int(d[i]) * w[i] for i in range(9)) + (int(d[8]) * 5) // 10
+    return (10 - s % 10) % 10 == int(d[9])
+
+
+def load_companies(path, log=print):
+    """목록 CSV 를 읽는다.
+
+    첫 열이 사업자등록번호, 둘째 열(선택)이 기업명, 셋째 열(선택)이 분류.
+    둘째·셋째 열은 합쳐서 메모가 된다 -> "삼성중공업(주) (GC)".
+    엑셀 `메모` 열과 실행 로그에 그대로 나온다.
+    """
     if not path.exists():
         return []
     out = []
     text, enc = read_text_any(path)
     if enc != "utf-8-sig":
-        print("  companies.csv 인코딩: %s" % enc)
+        log("  %s 인코딩: %s" % (path.name, enc))
     import io as _io
     if True:
-        f = _io.StringIO(text)
-        for row in csv.reader(f):
+        for lineno, row in enumerate(csv.reader(_io.StringIO(text)), 1):
             if not row:
                 continue
             raw = row[0].strip()
             if not raw or raw.startswith("#"):
                 continue
-            digits = re.sub(r"\D", "", raw)
-            if len(digits) != 10:
-                if digits:
-                    print("  건너뜀 (10자리 아님): %s" % raw)
+            digits, note = normalize_bizno(raw)
+            if digits is None:
+                log("  %d행 건너뜀 (%s): %s" % (lineno, note, raw))
                 continue
-            memo = row[1].strip() if len(row) > 1 else ""
+            if note:
+                log("  %d행 %s" % (lineno, note))
+            if not bizno_checksum_ok(digits):
+                log("  %d행 경고: 검증코드 불일치 %s - 번호가 틀렸을 수 있습니다"
+                    % (lineno, fmt_bizno(digits)))
+            name = row[1].strip() if len(row) > 1 else ""
+            tag = row[2].strip() if len(row) > 2 else ""
+            memo = "%s (%s)" % (name, tag) if name and tag else (name or tag)
             out.append((digits, memo))
     # 중복 제거 (순서 유지)
     seen, uniq = set(), []
@@ -282,8 +370,8 @@ def run_batch(req_ctx, user, companies, st, ed, log, notify):
     rows, failed = PARTIAL["rows"], PARTIAL["failed"]
     total = len(companies)
     OUT_DIR.mkdir(exist_ok=True)
-    part_path = OUT_DIR / ("_진행중_%s.csv"
-                           % datetime.date.today().strftime("%Y%m%d"))
+    part_path = OUT_DIR / ("_진행중%s_%s.csv"
+                           % (OUT_TAG, datetime.date.today().strftime("%Y%m%d")))
     cols = ["사업자등록번호", "메모"] + [c for c, _ in COLMAP if c != "_bizno"
                                         and c != "사업자등록번호"]
     part = open(part_path, "w", encoding="utf-8-sig", newline="")
@@ -315,6 +403,14 @@ def run_batch(req_ctx, user, companies, st, ed, log, notify):
         except Exception as e:
             log("       -> 실패: %s" % e)
             failed.append((fmt_bizno(bizno), memo, str(e)[:160]))
+            # 실패해도 목록에서 빠지지 않게 빈 행을 남긴다. 원본 순서를 지켜야
+            # 나중에 대조할 수 있고, 조회가 안 된 기업이 조용히 사라지지 않는다.
+            rec = {"사업자등록번호": fmt_bizno(bizno),
+                   "결과코드": ERR_CD, "결과내용": str(e)[:160]}
+            if memo:
+                rec["메모"] = memo
+            rows.append(rec)
+            pw.writerow(rec); part.flush()
         if i < total:
             time.sleep(DELAY_SEC)
     part.close()
@@ -322,11 +418,169 @@ def run_batch(req_ctx, user, companies, st, ed, log, notify):
     return rows, failed
 
 
+# ---- 엑셀 서식 -------------------------------------------------------------
+# 잔액/금액은 1의 자리까지. 소수점은 버리지 않고 반올림해서 보여만 준다
+# (셀에는 원래 값이 그대로 있으므로 합계·검산에는 영향이 없다).
+FMT_MONEY = '#,##0;[Red]-#,##0;"-"'
+FMT_COUNT = '#,##0;-#,##0;"-"'
+# 백만 단위 합계 열. 여기서는 소수점 두 자리가 있어야 자릿수가 살아난다
+FMT_MN = '#,##0.00;[Red]-#,##0.00;"-"'
+
+C_HEAD = "1F3864"        # 머리글 배경 (진한 남색)
+C_HEAD_SUM = "1F6B3B"    # 합계 열 머리글 (진한 초록)
+C_BAND = "F4F6FA"        # 짝수 행 배경
+C_SUM = "EAF4EC"         # 합계 열 배경
+C_LINE = "D0D7E5"        # 격자선
+
+# 이 열부터 새 그룹이 시작된다. 왼쪽에 굵은 선을 넣어 묶음을 눈에 보이게 한다.
+GROUP_START = {"선물환_건수", "옵션_건수", "통화스왑_건수", "USD환산금액"}
+
+
+def _style_sheet(ws, ncol, nrow, headers, sumcols=(), freeze_col=1):
+    """머리글 + 격자 + 줄무늬 + 정렬. 모든 시트에 공통으로 쓴다."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    thin = Side(style="thin", color=C_LINE)
+    thick = Side(style="medium", color="9AA7BD")
+    head_font = Font(bold=True, color="FFFFFF", size=10)
+    band = PatternFill("solid", fgColor=C_BAND)
+    sumfill = PatternFill("solid", fgColor=C_SUM)
+
+    # 제일 긴 제목이 몇 줄로 접히는지 보고 머리글 높이를 잡는다
+    longest = max([_disp_len(h) for h in headers] or [10])
+    ws.row_dimensions[1].height = max(34, min(4, -(-longest // 22)) * 15 + 8)
+    for c in range(1, ncol + 1):
+        name = headers[c - 1]
+        is_sum = name in sumcols
+        h = ws.cell(1, c)
+        h.font = head_font
+        h.fill = PatternFill("solid",
+                             fgColor=C_HEAD_SUM if is_sum else C_HEAD)
+        h.alignment = Alignment(horizontal="center", vertical="center",
+                                wrap_text=True)
+        left = thick if (name in GROUP_START or is_sum) else thin
+        h.border = Border(left=left, right=thin, top=thin, bottom=thin)
+        for r in range(2, nrow + 2):
+            cell = ws.cell(r, c)
+            cell.border = Border(left=left, right=thin, top=thin, bottom=thin)
+            if is_sum:
+                cell.fill = sumfill
+                cell.font = Font(bold=True, size=10)
+            elif r % 2 == 1:
+                cell.fill = band
+
+    if nrow:
+        ws.auto_filter.ref = "A1:%s%d" % (ws.cell(1, ncol).column_letter, nrow + 1)
+    ws.freeze_panes = ws.cell(2, freeze_col + 1).coordinate
+
+
+def _disp_len(s):
+    """엑셀 열 너비용 글자수. 한글·한자는 두 칸을 먹는다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in str(s))
+
+
+def _fit_widths(ws, df, ncol):
+    for idx in range(1, ncol + 1):
+        name = str(df.columns[idx - 1])
+        # 머리글은 줄바꿈되므로 가장 긴 낱말만 있으면 된다.
+        # '_' 와 '+' 뒤에서도 끊어 읽는다 (합계 열 제목이 길다)
+        words = name.replace("_", "_ ").replace("+", "+ ").split()
+        head_w = max([_disp_len(w) for w in words] or [8])
+        body = df.iloc[:, idx - 1].dropna().astype(str).head(80)
+        body_w = max([_disp_len(v) for v in body] or [0])
+        if name in NUMERIC:                       # 천단위 쉼표 자리
+            body_w = min(body_w, 15)
+        width = min(max(head_w + 3, body_w + 3, 9), 26)
+        ws.column_dimensions[ws.cell(1, idx).column_letter].width = width
+
+
+def split_dttm(df, src="조회일시", parts=("조회일자", "조회시각")):
+    """'2026-08-31 15:40:35' 한 열을 날짜 / 시각 두 열로 쪼갠다.
+
+    자리는 원래 열이 있던 그 자리. 문자열로 둔다 (ISO 형식이라 그대로 정렬된다).
+    """
+    if src not in df.columns:
+        return df
+    at = list(df.columns).index(src)
+    s = df[src].astype(str).str.strip()
+    s = s.mask(s.isin(("", "nan", "None", "NaT")))
+    d = s.str.slice(0, 10)
+    t = s.str.slice(11).str.strip().replace("", None)
+    df = df.drop(columns=[src])
+    df.insert(at, parts[0], d)
+    df.insert(at + 1, parts[1], t)
+    return df
+
+
+def format_grid(ws, df, sumnames=()):
+    """'파생거래' 시트 서식. 새로 만들 때도, 기존 파일을 다시 꾸밀 때도 쓴다."""
+    from openpyxl.styles import Alignment, Font
+
+    ncol, nrow = len(df.columns), len(df)
+    # 기업명까지 고정해 두면 오른쪽으로 밀어도 어느 회사인지 보인다
+    freeze = (list(df.columns).index("기업명") + 1
+              if "기업명" in df.columns else 1)
+    _style_sheet(ws, ncol, nrow, list(df.columns), sumnames, freeze)
+    _fit_widths(ws, df, ncol)
+
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    sumset = {n for n, _ in SUMCOLS}
+    for idx, c in enumerate(df.columns, 1):
+        if c in NUMERIC:
+            if c in sumset:
+                fmt = FMT_MN
+            elif c in COUNTCOLS:
+                fmt = FMT_COUNT
+            else:
+                fmt = FMT_MONEY
+            align = right
+        elif (c in ("사업자등록번호", "결과코드", "조회일자", "조회시각")
+              or "최종갱신일" in c):
+            fmt, align = None, center
+        else:
+            fmt, align = None, left
+        for r in range(2, nrow + 2):
+            cell = ws.cell(r, idx)
+            if fmt and not isinstance(cell.value, str):
+                cell.number_format = fmt
+            # 합계 열에 들어간 '붙이지 마시오' 는 가운데로 (숫자만 오른쪽)
+            cell.alignment = center if (c in sumset
+                                        and isinstance(cell.value, str)) else align
+
+    # 조회 실패/무자료 행은 흐리게 (결과코드 000 이 아닌 행).
+    # 엑셀을 거치며 '000' 이 숫자 0 이 되기도 하므로 norm_rspcd 로 맞춰 본다.
+    if "결과코드" in df.columns:
+        rc = list(df.columns).index("결과코드") + 1
+        for r in range(2, nrow + 2):
+            code = norm_rspcd(ws.cell(r, rc).value)
+            if code in (None, OK_CD):
+                continue
+            for idx in range(1, ncol + 1):
+                cur = ws.cell(r, idx).font
+                ws.cell(r, idx).font = Font(bold=cur.bold, size=10,
+                                            color="9098A8")
+
+
+def format_plain(ws, df):
+    """'조회정보' / '실패' 처럼 단순한 시트 서식."""
+    from openpyxl.styles import Alignment
+    ncol = len(df.columns)
+    _style_sheet(ws, ncol, len(df), list(df.columns))
+    _fit_widths(ws, df, ncol)
+    left = Alignment(horizontal="left", vertical="center")
+    for r in range(2, len(df) + 2):
+        for c in range(1, ncol + 1):
+            ws.cell(r, c).alignment = left
+
+
 def write_excel(rows, failed, st, ed, log):
     import pandas as pd
     OUT_DIR.mkdir(exist_ok=True)
     today = datetime.date.today().strftime("%Y%m%d")
-    path = OUT_DIR / ("파생거래_%s.xlsx" % today)
+    path = OUT_DIR / ("파생거래%s_%s.xlsx" % (OUT_TAG, today))
 
     cols = [c for c, _ in COLMAP if c != "_bizno"]
     cols = ["사업자등록번호"] + [c for c in cols if c != "사업자등록번호"]
@@ -336,47 +590,77 @@ def write_excel(rows, failed, st, ed, log):
     for c in df.columns:
         if c in NUMERIC:
             df[c] = df[c].map(to_num)
+        if "최종갱신일" in c:
+            # 자료가 없으면 '0000-00-00' 이 온다. 빈 칸이 읽기 낫다
+            df[c] = df[c].replace({"0000-00-00": None, "00000000": None})
+    df = split_dttm(df)
+    if "결과코드" in df.columns:
+        df["결과코드"] = df["결과코드"].map(norm_rspcd)
+
+    # 합계 열 (맨 끝). 한쪽만 값이 있으면 그 값, 양쪽 다 비면 빈 칸으로 둔다.
+    # 값 자체를 백만으로 나눠 넣는다. 정렬·차트가 표시 단위와 어긋나지 않게.
+    # 결과가 없는 행(401·ERR)은 숫자 대신 경고 문구를 넣는다. 0 으로 두면
+    # 다른 데 옮겨 붙일 때 잔액이 정말 0 인 기업과 구별이 안 된다.
+    for name, srcs in SUMCOLS:
+        v = df[list(srcs)].sum(axis=1, min_count=1) / SUM_UNIT
+        if "결과코드" in df.columns:
+            v = v.astype(object).where(df["결과코드"].eq(OK_CD), NO_RESULT_TEXT)
+        df[name] = v
+    sumnames = [n for n, _ in SUMCOLS]
 
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         df.to_excel(xw, sheet_name="파생거래", index=False)
+        # rows 에 실패 행도 들어 있으므로 rows 가 곧 요청 건수다.
+        n_401 = sum(1 for r in rows if str(r.get("결과코드") or "") == "401")
         meta = pd.DataFrame([
             ("조회일시", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ("조회기간", "%s ~ %s" % (st, ed)),
-            ("요청 기업수", len(rows) + len(failed)),
-            ("성공", len(rows)),
-            ("실패", len(failed)),
+            ("요청 기업수", len(rows)),
+            ("조회 성공", len(rows) - len(failed)),
+            ("  - 자료 있음", len(rows) - len(failed) - n_401),
+            ("  - 해당자료 없음(401)", n_401),
+            ("조회 실패", len(failed)),
         ], columns=["항목", "값"])
         meta.to_excel(xw, sheet_name="조회정보", index=False)
-        if failed:
-            pd.DataFrame(failed, columns=["사업자등록번호", "메모", "사유"]) \
-              .to_excel(xw, sheet_name="실패", index=False)
+        fdf = (pd.DataFrame(failed, columns=["사업자등록번호", "메모", "사유"])
+               if failed else None)
+        if fdf is not None:
+            fdf.to_excel(xw, sheet_name="실패", index=False)
 
-        ws = xw.sheets["파생거래"]
-        for idx, c in enumerate(df.columns, 1):
-            width = max(len(str(c)) + 2,
-                        *(len(str(v)) + 2 for v in df[c].head(60).astype(str))) \
-                    if len(df) else len(str(c)) + 2
-            ws.column_dimensions[ws.cell(1, idx).column_letter].width = min(width, 22)
-            if c in NUMERIC:
-                for r in range(2, len(df) + 2):
-                    ws.cell(r, idx).number_format = "#,##0.00"
-        ws.freeze_panes = "B2"
+        format_grid(xw.sheets["파생거래"], df, sumnames)
+        for name, sheet in (("조회정보", meta), ("실패", fdf)):
+            if sheet is not None:
+                format_plain(xw.sheets[name], sheet)
     log("\n엑셀 저장 -> %s" % path)
     return path
 
 
 # --------------------------------------------------------------------------
+def out_tag_for(path):
+    """companies1.csv -> '1'. 목록마다 결과 파일이 겹치지 않게 한다."""
+    m = re.match(r"^companies(.*)$", path.stem, re.I)
+    tag = m.group(1) if m else path.stem
+    return re.sub(r"[^0-9A-Za-z가-힣_-]", "", tag)
+
+
 def main():
-    global DELAY_SEC
+    global DELAY_SEC, OUT_TAG
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="st", default=None,
                     help="조회 시작일 YYYYMMDD (기본: 올해 1월 1일)")
     ap.add_argument("--to", dest="ed", default=None,
                     help="조회 종료일 YYYYMMDD (기본: 오늘)")
     ap.add_argument("--delay", type=float, default=DELAY_SEC)
+    ap.add_argument("--companies", default=None,
+                    help="조회 대상 목록 CSV (기본: companies.csv). "
+                         "companies1.csv 를 주면 결과는 파생거래1_YYYYMMDD.xlsx")
     a = ap.parse_args()
 
     DELAY_SEC = a.delay
+    comp_path = pathlib.Path(a.companies) if a.companies else COMPANIES
+    if not comp_path.is_absolute():
+        comp_path = (BASE / comp_path) if not comp_path.exists() else comp_path
+    OUT_TAG = out_tag_for(comp_path)
     today = datetime.date.today()
     st = a.st or today.replace(month=1, day=1).strftime("%Y%m%d")
     ed = a.ed or today.strftime("%Y%m%d")
@@ -385,9 +669,10 @@ def main():
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log = Log(LOG_DIR / ("scrape_" + stamp + ".log"))
 
-    companies = load_companies(COMPANIES)
+    log("목록 파일: %s" % comp_path.name)
+    companies = load_companies(comp_path, log)
     if not companies:
-        log("companies.csv 에 사업자등록번호가 없습니다: %s" % COMPANIES)
+        log("%s 에 사업자등록번호가 없습니다: %s" % (comp_path.name, comp_path))
         log("한 줄에 하나씩, 10자리 숫자로 넣어주세요. (하이픈은 있어도 됩니다)")
         log.close()
         return 1
@@ -472,7 +757,8 @@ def main():
                 except KeyboardInterrupt:
                     log("\n중단됨. 지금까지 받은 결과만 저장합니다.")
                     rows, failed = PARTIAL["rows"], PARTIAL["failed"]
-                notify("완료: 성공 %d / 실패 %d" % (len(rows), len(failed)))
+                notify("완료: %d건 중 성공 %d / 실패 %d"
+                       % (len(rows), len(rows) - len(failed), len(failed)))
                 break
             try:
                 pages[0].wait_for_timeout(400)
@@ -484,7 +770,8 @@ def main():
 
         if rows is not None:
             path = write_excel(rows, failed, st, ed, log)
-            log("성공 %d / 실패 %d" % (len(rows), len(failed)))
+            log("%d건 중 성공 %d / 실패 %d"
+                % (len(rows), len(rows) - len(failed), len(failed)))
             for b, m, why in failed:
                 log("  실패: %s %s - %s" % (b, m, why))
             notify("저장 완료: %s" % path.name)
