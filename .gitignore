@@ -1,0 +1,6 @@
+browser_profile/
+session_state.json
+capture/
+output/
+logs/
+__pycache__/
